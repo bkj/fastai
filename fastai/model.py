@@ -5,6 +5,8 @@ from .layer_optimizer import *
 from .swa import *
 from .fp16 import *
 
+IS_TORCH_04 = LooseVersion(torch.__version__) >= LooseVersion('0.4')
+
 def cut_model(m, cut):
     return list(m.children())[:cut] if cut else [m]
 
@@ -57,7 +59,14 @@ class Stepper():
         if self.loss_scale != 1:
             for param in self.fp32_params: param.grad.data.div_(self.loss_scale)
         if self.clip:   # Gradient clipping
-            nn.utils.clip_grad_norm(trainable_params_(self.m), self.clip)
+            if IS_TORCH_04: nn.utils.clip_grad_norm_(trainable_params_(self.m), self.clip)
+            else: nn.utils.clip_grad_norm(trainable_params_(self.m), self.clip)
+        if 'wd' in self.opt.param_groups and self.opt.param_groups['wd'] != 0: 
+            #Weight decay out of the loss. After the gradient computation but before the step.
+            for group in self.opt.param_groups:
+                lr, wd = group['lr'], group['wd']
+                for p in group['params']:
+                    if p.grad is not None: p.data = p.data.add(-wd * lr, p.data)
         self.opt.step()
         if self.fp16: 
             copy_fp32_to_model(self.m, self.fp32_params)
@@ -89,8 +98,8 @@ def fit(model, data, n_epochs, opt, crit, metrics=None, callbacks=None, stepper=
        n_epochs(int or list): number of epochs (or list of number of epochs)
        crit: loss function to optimize. Example: F.cross_entropy
     """
+
     all_val = kwargs.pop('all_val') if 'all_val' in kwargs else False
-    sampler = kwargs.pop('sampler') if 'sampler' in kwargs else None
     get_ep_vals = kwargs.pop('get_ep_vals') if 'get_ep_vals' in kwargs else False
     metrics = metrics or []
     callbacks = callbacks or []
@@ -103,25 +112,26 @@ def fit(model, data, n_epochs, opt, crit, metrics=None, callbacks=None, stepper=
         names += swa_names
         # will use this to call evaluate later
         swa_stepper = stepper(swa_model, None, crit, **kwargs)
-        
+
     layout = "{!s:10} " * len(names)
     if not isinstance(n_epochs, Iterable): n_epochs=[n_epochs]
     if not isinstance(data, Iterable): data = [data]
     if len(data) == 1: data = data * len(n_epochs)
     for cb in callbacks: cb.on_phase_begin()
-    if hasattr(opt,'state_dict'): model_stepper = stepper(model, opt, crit, **kwargs) 
-    else:  model_stepper = stepper(model, opt.opt, crit, **kwargs)
+    model_stepper = stepper(model, opt.opt if hasattr(opt,'opt') else opt, crit, **kwargs)
     ep_vals = collections.OrderedDict()
     tot_epochs = int(np.ceil(np.array(n_epochs).sum()))
     cnt_phases = np.array([ep * len(dat.trn_dl) for (ep,dat) in zip(n_epochs,data)]).cumsum()
     phase = 0
     for epoch in tnrange(tot_epochs, desc='Epoch'):
-        if sampler: sampler.set_epoch(epoch)
         model_stepper.reset(True)
         cur_data = data[phase]
+        if hasattr(cur_data, 'trn_sampler'): cur_data.trn_sampler.set_epoch(epoch)
+        if hasattr(cur_data, 'val_sampler'): cur_data.val_sampler.set_epoch(epoch)
         num_batch = len(cur_data.trn_dl)
         t = tqdm(iter(cur_data.trn_dl), leave=False, total=num_batch)
         if all_val: val_iter = IterBatch(cur_data.val_dl)
+
         for (*x,y) in t:
             batch_num += 1
             for cb in callbacks: cb.on_batch_begin()
@@ -137,12 +147,12 @@ def fit(model, data, n_epochs, opt, crit, metrics=None, callbacks=None, stepper=
                 for cb in callbacks: cb.on_phase_end()
                 phase += 1
                 if phase >= len(n_epochs):
-                    t.close()#Weird bug with the bar not disappearing
+                    t.close()
                     break
                 for cb in callbacks: cb.on_phase_begin()
                 if isinstance(opt, LayerOptimizer): model_stepper.opt = opt.opt
-                if cur_data != data[phase]: 
-                    t.close()#Weird bug with the bar not disappearing
+                if cur_data != data[phase]:
+                    t.close()
                     break
 
         if not all_val:
@@ -160,10 +170,8 @@ def fit(model, data, n_epochs, opt, crit, metrics=None, callbacks=None, stepper=
             ep_vals = append_stats(ep_vals, epoch, [debias_loss] + vals)
         if stop: break
     for cb in callbacks: cb.on_train_end()
-    if get_ep_vals:
-        return vals, ep_vals
-    else:
-        return vals
+    if get_ep_vals: return vals, ep_vals
+    else: return vals
 
 def append_stats(ep_vals, epoch, values, decimals=6):
     ep_vals[epoch]=list(np.round(values, decimals))
@@ -193,10 +201,11 @@ class IterBatch():
 def validate_next(stepper, metrics, val_iter):
     """Computes the loss on the next minibatch of the validation set."""
     stepper.reset(False)
-    (*x,y) = val_iter.next()
-    preds,l = stepper.evaluate(VV(x), VV(y))
-    res = [to_np(l)[0]]
-    res += [f(preds.data,y) for f in metrics]
+    with no_grad_context():
+        (*x,y) = val_iter.next()
+        preds,l = stepper.evaluate(VV(x), VV(y))
+        res = [to_np(l)[0]]
+        res += [f(preds.data,y) for f in metrics]
     stepper.reset(True)
     return res
 
@@ -205,15 +214,12 @@ def validate(stepper, dl, metrics):
     stepper.reset(False)
     with no_grad_context():
         for (*x,y) in iter(dl):
-            y = VV(y)
-            preds,l = stepper.evaluate(VV(x), y)
+            preds, l = stepper.evaluate(VV(x), VV(y))
             if isinstance(x,list): batch_cnts.append(len(x[0]))
             else: batch_cnts.append(len(x))
             loss.append(to_np(l))
-            res.append([f(preds.data,y.data) for f in metrics])
+            res.append([f(preds.data, y) for f in metrics])
     return [np.average(loss, 0, weights=batch_cnts)] + list(np.average(np.stack(res), 0, weights=batch_cnts))
-
-def no_grad_context(): return torch.no_grad() if IS_TORCH_04 else contextlib.suppress()
 
 def get_prediction(x):
     if is_listy(x): x=x[0]
@@ -221,7 +227,7 @@ def get_prediction(x):
 
 def predict(m, dl):
     preda,_ = predict_with_targs_(m, dl)
-    return to_np(torch.cat(preda))
+    return np.concatenate(preda)
 
 def predict_batch(m, x):
     m.eval()
@@ -232,12 +238,12 @@ def predict_with_targs_(m, dl):
     m.eval()
     if hasattr(m, 'reset'): m.reset()
     res = []
-    for *x,y in iter(dl): res.append([get_prediction(m(*VV(x))),y])
+    for *x,y in iter(dl): res.append([get_prediction(to_np(m(*VV(x)))),to_np(y)])
     return zip(*res)
 
 def predict_with_targs(m, dl):
     preda,targa = predict_with_targs_(m, dl)
-    return to_np(torch.cat(preda)), to_np(torch.cat(targa))
+    return np.concatenate(preda), np.concatenate(targa)
 
 # From https://github.com/ncullen93/torchsample
 def model_summary(m, input_size):
