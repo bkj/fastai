@@ -6,7 +6,7 @@
     Simplification of ULMFit
 """
 
-from fastai.core import to_np, to_gpu, T, partition_by_cores, children
+from fastai.core import to_np, to_gpu, T, partition_by_cores
 from fastai.dataloader import DataLoader
 
 from fastai.lm_rnn import get_rnn_classifer, seq2seq_reg
@@ -181,15 +181,6 @@ wgts['1.decoder.weight']                    = T(np.copy(new_w))
 
 # --
 # Language model
-
-class BasicModel():
-    def __init__(self, model, name='unnamed'):
-        self.model = model
-        self.name = name
-    
-    def get_layer_groups(self, do_fc=False):
-        return children(self.model)
-
 
 wd     = 1e-7
 bptt   = 70
