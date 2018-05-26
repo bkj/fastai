@@ -2,9 +2,9 @@ from fastai.text import *
 import html
 import fire
 
-def tok2id(prefix, max_vocab=60000, min_freq=1):
-    print(f'prefix {prefix} max_vocab {max_vocab} min_freq {min_freq}')
-    PATH=f'data/nlp_clas/{prefix}/'
+def tok2id(max_vocab=60000, min_freq=1):
+    print(f'max_vocab {max_vocab} min_freq {min_freq}')
+    PATH=f'data/imdb_clas/'
     trn_tok = np.load(f'{PATH}tmp/tok_trn.npy')
     val_tok = np.load(f'{PATH}tmp/tok_val.npy')
 

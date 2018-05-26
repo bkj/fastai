@@ -31,11 +31,11 @@ class EarlyStopping(Callback):
         self.learner.load(self.save_path)
 
 
-def train_lm(prefix, cuda_id=0, cl=1, pretrain='wikitext-103-nopl', lm_id='', bs=64,
+def train_lm(cuda_id=0, cl=1, pretrain='wt103', lm_id='', bs=64,
              dropmult=1.0, backwards=False, lr=0.4e-3, preload=True, bpe=False, startat=0,
              use_clr=True, use_regular_schedule=False, use_discriminative=True, notrain=False, joined=False,
              train_file_id='', early_stopping=False, figshare=False):
-    print(f'prefix {prefix}; cuda_id {cuda_id}; cl {cl}; bs {bs}; backwards {backwards} '
+    print(f'cuda_id {cuda_id}; cl {cl}; bs {bs}; backwards {backwards} '
           f'dropmult {dropmult}; lr {lr}; preload {preload}; bpe {bpe}; startat {startat} '
           f'pretrain {pretrain}; use_clr {use_clr}; notrain {notrain}; joined {joined} '
           f'early stopping {early_stopping}, figshare {figshare}')
@@ -49,10 +49,10 @@ def train_lm(prefix, cuda_id=0, cl=1, pretrain='wikitext-103-nopl', lm_id='', bs
 
     def get_joined_id(): return 'lm_' if joined else ''
     joined_id = 'fig_' if figshare else get_joined_id()
-    PATH=f'data/nlp_clas/{prefix}/'
-    PRETRAIN_PATH=f'data/nlp_clas/{pretrain}'
+    PATH=f'data/imdb_clas/'
+    PRETRAIN_PATH=f'data/imdb_clas/{pretrain}'
     assert os.path.exists(PRETRAIN_PATH), 'Error: %s does not exist.' % PRETRAIN_PATH
-    PRE_LM_PATH=f'{PRETRAIN_PATH}/models/{PRE}lm_3.h5'
+    PRE_LM_PATH=f'{PRETRAIN_PATH}/models/{PRE}wt103.h5'
     assert os.path.exists(PRE_LM_PATH), 'Error: %s does not exist.' % PRE_LM_PATH
     if lm_id != '': lm_id += '_'
     lm_path=f'{PRE}{lm_id}lm'
@@ -107,7 +107,7 @@ def train_lm(prefix, cuda_id=0, cl=1, pretrain='wikitext-103-nopl', lm_id='', bs
             ew = to_np(wgts['0.encoder.weight'])
             row_m = ew.mean(0)
 
-            itos2 = pickle.load(open(f'{PRETRAIN_PATH}/tmp/itos.pkl', 'rb'))
+            itos2 = pickle.load(open(f'{PRETRAIN_PATH}/models/itos_wt103.pkl', 'rb'))
             stoi2 = collections.defaultdict(lambda:-1, {v:k for k,v in enumerate(itos2)})
             nw = np.zeros((vs, em_sz), dtype=np.float32)
             nb = np.zeros((vs,), dtype=np.float32)
