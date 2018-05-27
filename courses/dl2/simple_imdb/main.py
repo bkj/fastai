@@ -6,9 +6,11 @@
     Simplification of ULMFit
 """
 
+import sys
+sys.path.append('../../../')
 from fastai.core import to_np, to_gpu, T, partition_by_cores
 from fastai.dataloader import DataLoader
-
+from fastai.metrics import accuracy
 from fastai.lm_rnn import get_rnn_classifer, seq2seq_reg
 from fastai.text import Tokenizer, TextDataset, SortSampler, SortishSampler,\
     LanguageModelData, LanguageModelLoader, TextModel, RNN_Learner
@@ -73,7 +75,7 @@ df_val.to_csv(CLAS_PATH/'test.csv', header=False, index=False)
 # LM data
 # !! Training the LM on train and test data?  Smells a little funny to me...
 # !! Not a huge deal probably, 
-`
+
 trn_texts,val_texts = train_test_split(
     np.concatenate([trn_texts,val_texts]), test_size=0.1)
 
@@ -118,6 +120,7 @@ def get_all(df, n_lbls):
         tok += tok_;
         labels += labels_
     return tok, labels
+
 
 df_trn = pd.read_csv(LM_PATH/'train.csv', header=None, chunksize=chunksize)
 df_val = pd.read_csv(LM_PATH/'test.csv', header=None, chunksize=chunksize)
@@ -187,8 +190,8 @@ bptt   = 70
 bs     = 52
 opt_fn = partial(torch.optim.Adam, betas=(0.8, 0.99))
 
-trn_dl = LanguageModelLoader(ds=np.concatenate(trn_lm), bs=bs, bptt=bptt)
-val_dl = LanguageModelLoader(ds=np.concatenate(val_lm), bs=bs, bptt=bptt)
+trn_dl = LanguageModelLoader(np.concatenate(trn_lm), bs=bs, bptt=bptt)
+val_dl = LanguageModelLoader(np.concatenate(val_lm), bs=bs, bptt=bptt)
 md = LanguageModelData(
     path    = PATH,
     pad_idx = 1, 

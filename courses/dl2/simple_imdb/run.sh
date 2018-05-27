@@ -10,3 +10,5 @@ tar -xzvf aclImdb_v1.tar.gz && mv aclImdb data/aclImdb/
 python -m spacy download en
 
 wget -nH -r -np -P data/ http://files.fast.ai/models/wt103/
+
+python main.py
