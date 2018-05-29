@@ -9,13 +9,16 @@
 from fastai.core import to_np, to_gpu, T, partition_by_cores, children
 from fastai.dataloader import DataLoader
 from fastai.dataset import ModelData
-
-from fastai.lm_rnn import seq2seq_reg, get_language_model, get_rnn_classifer
+from fastai.lm_rnn import seq2seq_reg, get_language_model, get_rnn_classifer, repackage_var
 from fastai.text import Tokenizer, TextDataset, SortSampler, SortishSampler
+from fastai.learner import Learner
+from fastai.rnn_reg import EmbeddingDropout, WeightDrop, LockedDropout
+from fastai.metrics import accuracy
 
 import re
 import html
 import pickle
+import warnings
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -25,18 +28,19 @@ from sklearn.model_selection import train_test_split
 
 import torch
 from torch import nn
+from torch.autograd import Variable
 from torch.nn import functional as F
 
 # --
 
 BOS  = 'xbos'  # beginning-of-sentence tag
 FLD  = 'xfld'  # data field tag
-PATH = Path('data/aclImdb/')
+PATH = Path('data2/aclImdb/')
 
-CLAS_PATH = Path('data/imdb_clas/')
+CLAS_PATH = Path('data2/imdb_clas/')
 CLAS_PATH.mkdir(exist_ok=True)
 
-LM_PATH = Path('data/imdb_lm/')
+LM_PATH = Path('data2/imdb_lm/')
 LM_PATH.mkdir(exist_ok=True)
 
 # --
@@ -76,7 +80,7 @@ df_val.to_csv(CLAS_PATH/'test.csv', header=False, index=False)
 # LM data
 # !! Training the LM on train and test data?  Smells a little funny to me...
 # !! Not a huge deal probably, 
-`
+
 trn_texts,val_texts = train_test_split(
     np.concatenate([trn_texts,val_texts]), test_size=0.1)
 
@@ -90,7 +94,7 @@ df_val.to_csv(LM_PATH/'test.csv', header=False, index=False)
 # Language model tokens
 
 chunksize = 24000
-max_vocab = 60000
+max_vocab = 30000 # 60000
 min_freq  = 2
 
 re1 = re.compile(r'  +')
@@ -103,7 +107,7 @@ def fixup(x):
     return re1.sub(' ', html.unescape(x))
 
 def get_texts(df, n_lbls=1):
-    labels = df.iloc[:,range(n_lbls)].values.astype(np.int64)
+    labels = list(df.iloc[:,range(n_lbls)].values.astype(np.int64))
     texts = f'\n{BOS} {FLD} 1 ' + df[n_lbls].astype(str)
     for i in range(n_lbls+1, len(df.columns)):
         texts += f' {FLD} {i-n_lbls} ' + df[i].astype(str)
@@ -111,50 +115,39 @@ def get_texts(df, n_lbls=1):
     texts = texts.apply(fixup).values.astype(str)
     
     tok = Tokenizer().proc_all_mp(partition_by_cores(texts))
-    return tok, list(labels)
+    return tok, labels
 
 def get_all(df, n_lbls):
     tok, labels = [], []
     for i, r in enumerate(df):
         print(i)
         tok_, labels_ = get_texts(r, n_lbls)
-        tok += tok_;
+        tok += tok_
         labels += labels_
     return tok, labels
 
 df_trn = pd.read_csv(LM_PATH/'train.csv', header=None, chunksize=chunksize)
 df_val = pd.read_csv(LM_PATH/'test.csv', header=None, chunksize=chunksize)
 
-tok_trn, trn_labels = get_all(df_trn, 1)
-tok_val, val_labels = get_all(df_val, 1)
+tok_trn, trn_labels = get_all(df_trn, n_lbls=1)
+tok_val, val_labels = get_all(df_val, n_lbls=1)
 
 (LM_PATH/'tmp').mkdir(exist_ok=True)
 np.save(LM_PATH/'tmp'/'tok_trn.npy', tok_trn)
 np.save(LM_PATH/'tmp'/'tok_val.npy', tok_val)
 
-tok_trn = np.load(LM_PATH/'tmp'/'tok_trn.npy')
-tok_val = np.load(LM_PATH/'tmp'/'tok_val.npy')
-
 freq = Counter(p for o in tok_trn for p in o)
-freq.most_common(25)
-
-itos = [o for o,c in freq.most_common(max_vocab) if c>min_freq]
+itos = [o for o,c in freq.most_common(max_vocab) if c > min_freq]
 itos.insert(0, '_pad_')
 itos.insert(0, '_unk_')
 
 stoi = defaultdict(lambda:0, {v:k for k,v in enumerate(itos)})
-len(itos)
-
 trn_lm = np.array([[stoi[o] for o in p] for p in tok_trn])
 val_lm = np.array([[stoi[o] for o in p] for p in tok_val])
 
 np.save(LM_PATH/'tmp'/'trn_ids.npy', trn_lm)
 np.save(LM_PATH/'tmp'/'val_ids.npy', val_lm)
 pickle.dump(itos, open(LM_PATH/'tmp'/'itos.pkl', 'wb'))
-
-trn_lm = np.load(LM_PATH/'tmp'/'trn_ids.npy')
-val_lm = np.load(LM_PATH/'tmp'/'val_ids.npy')
-itos = pickle.load(open(LM_PATH/'tmp'/'itos.pkl', 'rb'))
 
 n_tok = len(itos)
 n_tok, len(trn_lm)
@@ -163,7 +156,7 @@ n_tok, len(trn_lm)
 # Load wikitext103
 
 emb_sz, nhid, nlayers = 400, 1150, 3
-PRE_PATH = Path('data')/'models'/'wt103'
+PRE_PATH = Path('data2/models/wt103')
 PRE_LM_PATH = PRE_PATH/'fwd_wt103.h5'
 
 wgts     = torch.load(PRE_LM_PATH, map_location=lambda storage, loc: storage)
@@ -174,7 +167,7 @@ itos2 = pickle.load((PRE_PATH/'itos_wt103.pkl').open('rb'))
 stoi2 = defaultdict(lambda:-1, {v:k for k,v in enumerate(itos2)})
 
 new_w = np.zeros((n_tok, emb_sz), dtype=np.float32)
-for i,w in enumerate(itos):
+for i, w in enumerate(itos):
     r = stoi2[w]
     new_w[i] = enc_wgts[r] if r >= 0 else row_m
 
@@ -185,7 +178,6 @@ wgts['1.decoder.weight']                    = T(np.copy(new_w))
 # --
 # Language model
 
-# Dataloader
 class LanguageModelLoader():
     def __init__(self, nums, bs, bptt, backwards=False):
         self.bs        = bs
@@ -228,17 +220,6 @@ class LanguageModelLoader():
 
 
 class RNN_Encoder(nn.Module):
-    
-    """A custom RNN encoder network that uses
-        - an embedding matrix to encode input,
-        - a stack of LSTM layers to drive the network, and
-        - variational dropouts in the embedding and LSTM layers
-        
-        The architecture for this network was inspired by the work done in
-        "Regularizing and Optimizing LSTM Language Models".
-        (https://arxiv.org/pdf/1708.02182.pdf)
-    """
-    
     def __init__(self, n_tok, emb_sz, nhid, nlayers, pad_token, bidir=False,
                  dropouth=0.3, dropouti=0.65, dropoute=0.1, wdrop=0.5, initrange=0.1):
         """ Default constructor for the RNN_Encoder class
@@ -258,7 +239,7 @@ class RNN_Encoder(nn.Module):
             Returns:
                 None
           """
-          
+        
         super().__init__()
         
         self.ndir = 2 if bidir else 1
@@ -279,7 +260,7 @@ class RNN_Encoder(nn.Module):
             self.rnns = [WeightDrop(rnn, wdrop) for rnn in self.rnns]
         
         self.rnns = torch.nn.ModuleList(self.rnns)
-        self.encoder.weight.data.uniform_(-self.initrange, self.initrange)
+        self.encoder.weight.data.uniform_(-initrange, initrange)
         
         self.emb_sz    = emb_sz
         self.nhid      = nhid
@@ -339,7 +320,7 @@ class LinearDecoder(nn.Module):
         super().__init__()
         
         self.decoder = nn.Linear(in_features=in_features, out_features=out_features, bias=False)
-        self.decoder.weight.data.uniform_(-self.initrange, self.initrange)
+        self.decoder.weight.data.uniform_(-initrange, initrange)
         if decoder_weights:
             self.decoder.weight = decoder_weights.weight
         
@@ -414,6 +395,8 @@ class LanguageModelData():
         self.trn_dl  = trn_dl
         self.val_dl  = val_dl
         self.test_dl = test_dl
+        
+        self.path = ''
 
 
 bptt  = 70
@@ -422,15 +405,15 @@ drops = np.array([0.25, 0.1, 0.2, 0.02, 0.15]) * 0.7
 
 learner = RNN_Learner(
     data=LanguageModelData(
-        trn_dl=LanguageModelLoader(ds=np.concatenate(trn_lm), bs=bs, bptt=bptt),
-        val_dl=LanguageModelLoader(ds=np.concatenate(val_lm), bs=bs, bptt=bptt),
+        trn_dl=LanguageModelLoader(np.concatenate(trn_lm), bs=bs, bptt=bptt),
+        val_dl=LanguageModelLoader(np.concatenate(val_lm), bs=bs, bptt=bptt),
     ), 
     models=LanguageModel(
         n_tok     = n_tok, 
         emb_sz    = emb_sz,
         nhid      = nhid, 
         nlayers   = nlayers, 
-        pad_token = pad_token, 
+        pad_token = 1, 
         dropouti  = drops[0],
         dropout   = drops[1],
         wdrop     = drops[2],

@@ -10,6 +10,7 @@ import sys
 sys.path.append('../../../')
 from fastai.core import to_np, to_gpu, T, partition_by_cores
 from fastai.dataloader import DataLoader
+from fastai.dataset import ModelData
 from fastai.metrics import accuracy
 from fastai.lm_rnn import get_rnn_classifer, seq2seq_reg
 from fastai.text import Tokenizer, TextDataset, SortSampler, SortishSampler,\
@@ -21,15 +22,15 @@ import torch
 import pickle
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 from pathlib import Path
 from functools import partial
 from collections import Counter, defaultdict
 from sklearn.model_selection import train_test_split
 
 # --
+# Params
 
-BOS  = 'xbos'  # beginning-of-sentence tag
-FLD  = 'xfld'  # data field tag
 PATH = Path('data/aclImdb/')
 
 CLAS_PATH = Path('data/imdb_clas/')
@@ -38,8 +39,13 @@ CLAS_PATH.mkdir(exist_ok=True)
 LM_PATH = Path('data/imdb_lm/')
 LM_PATH.mkdir(exist_ok=True)
 
+chunksize = 24000
+
 # --
 # Format data
+
+BOS = 'xbos'  # beginning-of-sentence tag
+FLD = 'xfld'  # data field tag
 
 CLASSES = ['neg', 'pos', 'unsup']
 COL_NAMES = ['labels', 'text']
@@ -50,6 +56,7 @@ def get_texts(path):
         for fname in (path/label).glob('*.*'):
             texts.append(fname.open('r').read())
             labels.append(idx)
+    
     return np.array(texts),np.array(labels)
 
 trn_texts, trn_labels = get_texts(PATH/'train')
@@ -88,8 +95,10 @@ df_val.to_csv(LM_PATH/'test.csv', header=False, index=False)
 # --
 # Language model tokens
 
-chunksize = 24000
+# >>
 max_vocab = 60000
+# max_vocab = 30000
+# <<
 min_freq  = 2
 
 re1 = re.compile(r'  +')
@@ -114,10 +123,9 @@ def get_texts(df, n_lbls=1):
 
 def get_all(df, n_lbls):
     tok, labels = [], []
-    for i, r in enumerate(df):
-        print(i)
-        tok_, labels_ = get_texts(r, n_lbls)
-        tok += tok_;
+    for chunk in tqdm(df):
+        tok_, labels_ = get_texts(chunk, n_lbls)
+        tok += tok_
         labels += labels_
     return tok, labels
 
@@ -125,8 +133,8 @@ def get_all(df, n_lbls):
 df_trn = pd.read_csv(LM_PATH/'train.csv', header=None, chunksize=chunksize)
 df_val = pd.read_csv(LM_PATH/'test.csv', header=None, chunksize=chunksize)
 
-tok_trn, trn_labels = get_all(df_trn, 1)
-tok_val, val_labels = get_all(df_val, 1)
+tok_trn, trn_labels = get_all(df_trn, n_lbls=1)
+tok_val, val_labels = get_all(df_val, n_lbls=1)
 
 (LM_PATH/'tmp').mkdir(exist_ok=True)
 np.save(LM_PATH/'tmp'/'tok_trn.npy', tok_trn)
@@ -163,7 +171,7 @@ vs, len(trn_lm)
 # Load wikitext103
 
 em_sz, nh, nl = 400, 1150, 3
-PRE_PATH = Path('data')/'models'/'wt103'
+PRE_PATH = Path('data/models/wt103')
 PRE_LM_PATH = PRE_PATH/'fwd_wt103.h5'
 
 wgts     = torch.load(PRE_LM_PATH, map_location=lambda storage, loc: storage)
@@ -240,6 +248,36 @@ learner.save_encoder('lm1_enc')
 # learner.sched.plot_loss()
 
 # --
+# Classifier data
+
+df_trn = pd.read_csv(CLAS_PATH/'train.csv', header=None, chunksize=chunksize)
+df_val = pd.read_csv(CLAS_PATH/'test.csv', header=None, chunksize=chunksize)
+
+tok_trn, trn_labels = get_all(df_trn, n_lbls=1)
+tok_val, val_labels = get_all(df_val, n_lbls=1)
+
+(CLAS_PATH/'tmp').mkdir(exist_ok=True)
+
+np.save(CLAS_PATH/'tmp'/'tok_trn.npy', tok_trn)
+np.save(CLAS_PATH/'tmp'/'tok_val.npy', tok_val)
+
+np.save(CLAS_PATH/'tmp'/'trn_labels.npy', trn_labels)
+np.save(CLAS_PATH/'tmp'/'val_labels.npy', val_labels)
+
+tok_trn = np.load(CLAS_PATH/'tmp'/'tok_trn.npy')
+tok_val = np.load(CLAS_PATH/'tmp'/'tok_val.npy')
+
+itos = pickle.load((LM_PATH/'tmp'/'itos.pkl').open('rb'))
+stoi = defaultdict(lambda:0, {v:k for k,v in enumerate(itos)})
+len(itos)
+
+trn_clas = np.array([[stoi[o] for o in p] for p in tok_trn])
+val_clas = np.array([[stoi[o] for o in p] for p in tok_val])
+
+np.save(CLAS_PATH/'tmp'/'trn_ids.npy', trn_clas)
+np.save(CLAS_PATH/'tmp'/'val_ids.npy', val_clas)
+
+# --
 # Classifier
 
 trn_clas = np.load(CLAS_PATH/'tmp'/'trn_ids.npy')
@@ -248,14 +286,17 @@ val_clas = np.load(CLAS_PATH/'tmp'/'val_ids.npy')
 trn_labels = np.squeeze(np.load(CLAS_PATH/'tmp'/'trn_labels.npy'))
 val_labels = np.squeeze(np.load(CLAS_PATH/'tmp'/'val_labels.npy'))
 
+itos     = pickle.load((LM_PATH/'tmp'/'itos.pkl').open('rb'))
+
 bptt, em_sz, nh, nl, bs = 70, 400, 1150, 3, 48
+
 vs     = len(itos)
 opt_fn = partial(torch.optim.Adam, betas=(0.8, 0.99))
 
 min_lbl = trn_labels.min()
 trn_labels -= min_lbl
 val_labels -= min_lbl
-c = int(trn_labels.max()) + 1
+n_class = int(trn_labels.max()) + 1
 
 trn_ds   = TextDataset(trn_clas, trn_labels)
 val_ds   = TextDataset(val_clas, val_labels)
@@ -265,25 +306,24 @@ trn_dl   = DataLoader(trn_ds, bs//2, transpose=True, num_workers=1, pad_idx=1, s
 val_dl   = DataLoader(val_ds, bs, transpose=True, num_workers=1, pad_idx=1, sampler=val_samp)
 md       = ModelData(PATH, trn_dl, val_dl)
 
-# !!!!!!!!!!!
 dps = np.array([0.4, 0.5, 0.05, 0.3, 0.1])
-dps = np.array([0.4,0.5,0.05,0.3,0.4]) * 0.5
+# dps = np.array([0.4,0.5,0.05,0.3,0.4]) * 0.5
 
 m = get_rnn_classifer(
-    bptt, 
-    20*70, 
-    c, 
-    vs, 
+    bptt=bptt, 
+    max_seq=20*70, 
+    n_class=n_class, 
+    n_tok=vs, 
     emb_sz=em_sz,
     n_hid=nh,
     n_layers=nl,
     pad_token=1,
-    layers=[em_sz*3, 50, c],
+    layers=[em_sz*3, 50, n_class],
     drops=[dps[4], 0.1],
     dropouti=dps[0],
     wdrop=dps[1],
     dropoute=dps[2],
-    dropouth=dps[3]
+    dropouth=dps[3],
 )
 
 opt_fn = partial(torch.optim.Adam, betas=(0.7, 0.99))
@@ -295,29 +335,29 @@ learn.metrics = [accuracy]
 
 lr  = 3e-3
 lrm = 2.6
-# !!!!!!!!!!!
 lrs = np.array([lr/(lrm**4), lr/(lrm**3), lr/(lrm**2), lr/lrm, lr])
-lrs = np.array([1e-4,1e-4,1e-4,1e-3,1e-2])
+# lrs = np.array([1e-4,1e-4,1e-4,1e-3,1e-2])
 
-# !!!!!!!!!!!
-wd = 1e-7
+# wd = 1e-7
 wd = 0
-learn.load_encoder('lm2_enc')
+learn.load_encoder('lm1_enc')
 
 learn.freeze_to(-1)
 # learn.lr_find(lrs/1000)
 # learn.sched.plot()
 learn.fit(lrs, 1, wds=wd, cycle_len=1, use_clr=(8,3))
-
 learn.save('clas_0')
 learn.load('clas_0')
+# 0.9238
+
 learn.freeze_to(-2)
 learn.fit(lrs, 1, wds=wd, cycle_len=1, use_clr=(8,3))
-
 learn.save('clas_1')
 learn.load('clas_1')
+# 0.9320
+
 learn.unfreeze()
 learn.fit(lrs, 1, wds=wd, cycle_len=14, use_clr=(32,10))
-
 learn.sched.plot_loss()
 learn.save('clas_2')
+# 0.946496
